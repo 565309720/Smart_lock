@@ -25,7 +25,14 @@ char receives[a][b];
 char connect_time = 0;														//记录连网次数
 char message_again_time = 0;												//心跳包检测失败后重发次数
 
-extern char GPSerr, CANerr;													//GPS,CAN总线错误标记位
+//锁的高低位地址
+extern char Lock_addH;
+extern char Lock_addL;
+
+//发送消息缓冲区
+#define send_Instruction_length 9
+char send_Instruction[send_Instruction_length];
+
 extern char Deviceerr;														//4G设备故障
 //extern GPS_GPGGA GPGGA;
 //extern GPS_GPRMC GPRMC;
@@ -35,6 +42,116 @@ extern char Deviceerr;														//4G设备故障
  *  y_axis:纵轴计数,即串口同一条命令下接受的数据条数(以\r\n作为一条数据结束标记)
  */
 __IO uint8_t x_axis = 0, y_axis = 0;
+
+/*
+ * 锁——开关控制函数
+ * 开锁:Door_lock
+ * 关锁:Door_unlock
+ */
+void Control_lock(char mode)							//开锁代码需要更改
+{
+	if (mode == Door_lock)
+	{
+		digitalWriteC(GPIO_Pin_14, HIGH);
+	} else if (mode == Door_unlock)
+	{
+		digitalWriteC(GPIO_Pin_14, LOW);
+	}
+}
+
+/*
+ * 接收指令解析程序
+ */
+void Instruction_received()
+{
+	int x = 0, y = 0;						//x:横坐标(一条指令的各个位),y:纵坐标(第几条指令)
+	while (!(receives[y][0] == '+'))		//寻找第一条指令，下一行为消息内容
+	{
+		y++;
+		if (y >= a)
+		{
+			return;
+		}
+	}
+	if (receives[y][7] == '0')
+	{
+		return;
+	} else
+	{
+		if ((receives[y + 1][0] == 0x55) && (receives[y + 1][1] == 0x55))			//确认为消息包头
+		{
+			if (receives[y + 1][2] == 0x03)											//开锁命令
+			{
+				Control_lock(Door_unlock);
+				Send_Door_Control_package(Door_open, Lock_addH, Lock_addL);			//回复开锁成功消息
+				delay_us(3000000);							//3秒后重新上锁
+				Control_lock(Door_lock);					//关锁,代码需要更改
+				return;
+			}
+
+		} else
+		{
+			Send_Door_Control_package(Unknow_message, Lock_addH, Lock_addL);		//回复收到未知消息
+			return;
+		}
+	}
+}
+
+/*
+ * 清除心跳包缓冲区
+ */
+void clear_Headbeat_package(char mode, char addH, char addL)
+{
+	send_Instruction[0] = 0x66;
+	send_Instruction[1] = 0x66;
+	send_Instruction[2] = mode;
+	send_Instruction[3] = addH;
+	send_Instruction[4] = addL;
+	send_Instruction[5] = 0x0D;
+	send_Instruction[6] = 0x0A;
+	send_Instruction[7] = '\0';
+	send_Instruction[8] = '\0';
+}
+
+/*
+ * 清除发送指令缓冲区
+ */
+void clear_send_Instruction(char mode, char addH, char addL)
+{
+	send_Instruction[0] = 0x55;
+	send_Instruction[1] = 0x55;
+	send_Instruction[2] = mode;
+	send_Instruction[3] = addH;
+	send_Instruction[4] = addL;
+	send_Instruction[5] = 0x0D;
+	send_Instruction[6] = 0x0A;
+	send_Instruction[7] = '\0';
+	send_Instruction[8] = '\0';
+}
+
+/*
+ * 发送心跳包指令消息
+ */
+void Send_HearBeat_package(char mode, char addH, char addL)
+{
+	send_cmd("AT+QISEND=0 \r\n");
+	delay_us(100000);
+	clear_Headbeat_package(mode, addH, addL);
+	printf("%x%x%x%x%x%x%x \r\n", send_Instruction[0], send_Instruction[1], send_Instruction[2],
+	        send_Instruction[3], send_Instruction[4], send_Instruction[5], send_Instruction[6]);
+}
+
+/*
+ * 发送开锁指令消息
+ */
+void Send_Door_Control_package(char mode, char addH, char addL)
+{
+	send_cmd("AT+QISEND=0 \r\n");
+	delay_us(100000);
+	clear_send_Instruction(mode, addH, addL);
+	printf("%x%x%x%x%x%x%x \r\n", send_Instruction[0], send_Instruction[1], send_Instruction[2],
+	        send_Instruction[3], send_Instruction[4], send_Instruction[5], send_Instruction[6]);
+}
 
 /*
  * 单独物联网设备复位
@@ -58,11 +175,11 @@ void FullSystemReset(int mode)
 }
 
 /*
- * 物联网设备断开MQTT服务并重连
+ * 物联网设备断开TCP服务并重连
  */
-void Connect_MQTT_again(int mode)
+void Connect_TCP_again(int mode)
 {
-	send_cmd("AT+QMTDISC=0 \r\n");		//关闭MQTT服务
+	send_cmd("AT+QICLOSE=0 \r\n");		//关闭MQTT服务
 	delay_us(200000);					//0.2s
 	if (check_receives("OK"))
 	{
@@ -86,6 +203,7 @@ void Clear_receives()
 		}
 	}
 }
+
 //清空IOT接收缓冲区的换行符号
 void Clear_receives_newline(int line)
 {
@@ -129,7 +247,7 @@ int Send_message_num()
 	int i, g, h = 0;
 	send_cmd("AT+QISEND=0,0 \r\n");
 	delay_us(1000000);
-	while (!(receives[h][0] == '+') && (receives[h][1] == 'Q') && (receives[h][3] == 's'))//找到+QISEND消息行
+	while (!(receives[h][0] == '+') && (receives[h][1] == 'Q') && (receives[h][3] == 's')) //找到+QISEND消息行
 	{
 		h++;
 	}
@@ -192,7 +310,7 @@ void IOT_Init(int mode)
 //			return;
 //		} else
 //		{
-//			Connect_MQTT_again(mode);
+//			Connect_TCP_again(mode);
 //			return;
 //		}
 		send_cmd("AT+QISEND=0 \r\n");
@@ -205,7 +323,7 @@ void IOT_Init(int mode)
 			;
 		} else
 		{
-			Connect_MQTT_again(mode);
+			Connect_TCP_again(mode);
 			return;
 		}
 		digitalWriteC(GPIO_Pin_14, LOW);					//联网成功
@@ -213,6 +331,7 @@ void IOT_Init(int mode)
 		connect_time = 0;								//复位连网次数
 	}
 }
+
 //检查是否Ping网成功
 bool check_Ping()
 {
@@ -308,12 +427,13 @@ void USART1_IRQHandler(void)
 //当心跳包检测不到时将尝试重发，3次后则返回失败
 bool Message_again()
 {
-	send_cmd("AT+QMTPUB=0,0,0,1,\"/a1f2CH9BSx7/ZRH_4G/user/put\" \r\n");
+	send_cmd("AT+QISEND=0 \r\n");
 	delay_us(100000); //0.1s
-	send_cmd("~ \r\n");
+	printf("%s%s%s%s%s \r\n", send_Instruction[0], send_Instruction[1], send_Instruction[2],
+	        send_Instruction[3], send_Instruction[4], send_Instruction[5]);
 	delay_us(300000); //0.3s
 
-	if (check_receives("+QMTPUB: 0,0,0"))
+	if (check_receives("SEND OK"))
 	{
 		message_again_time = 0;
 		return 1;
